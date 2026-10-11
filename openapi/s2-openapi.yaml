@@ -5,8 +5,8 @@ info:
   description: |
     OpenAPI description for the built-in `s2 --server` mode.
 
-    The server exposes a single multipart endpoint for text-to-speech synthesis
-    with optional reference-audio voice cloning.
+    The server serves a local browser GUI at `/`, a multipart endpoint for
+    speech synthesis, and endpoints to list and save voice profiles.
 
     By default the response is a finalized `audio/wav` download. When the
     request enables the streaming synthesis path (`params.stream=true`), the
@@ -30,6 +30,64 @@ tags:
     description: Text-to-speech synthesis
 
 paths:
+  /:
+    get:
+      summary: Open the local S2 Studio GUI
+      responses:
+        '200':
+          description: HTML voice cloning and testing interface.
+          content:
+            text/html:
+              schema:
+                type: string
+  /voices:
+    get:
+      summary: List saved voice profile IDs
+      responses:
+        '200':
+          description: Voice IDs in the server voice directory.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  voices:
+                    type: array
+                    items:
+                      type: string
+    post:
+      summary: Encode and save a reusable voice profile
+      description: Saves reference codes as a `.s2voice` profile; does not train model weights. A name may contain only ASCII letters, digits, underscores, and dashes.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [name, transcript, reference]
+              properties:
+                name:
+                  type: string
+                  pattern: '^[A-Za-z0-9_-]{1,64}$'
+                transcript:
+                  type: string
+                reference:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Profile saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  voice:
+                    type: string
+        '400':
+          description: Invalid or missing fields.
+        '503':
+          description: Another synthesis or profile save is active.
   /generate:
     post:
       tags:
@@ -351,8 +409,10 @@ components:
           type: integer
           minimum: 0
           description: |
-            Streaming decode cadence in frames. `0` keeps the server auto
-            cadence, currently `4` frames.
+            Decode cadence in frames. `0` uses `4` frames for server streaming
+            and `64` for offline synthesis. Offline decoding retains left
+            codec history without future-frame holdback and fills the first
+            window once before advancing at this cadence.
           default: 0
         stream_decode_stride:
           type: integer

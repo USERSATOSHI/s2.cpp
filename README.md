@@ -42,7 +42,7 @@ The `~5 GB VRAM` note below refers to model-weight memory after that fix; full r
 All variants include both the transformer weights and the audio codec in a single file.
 The quantized variants above were regenerated with the codec tensors (`c.*`) kept in `F16`, so only the AR transformer is quantized.
 
-On CUDA builds, `s2.cpp` keeps the embedding tables on CPU in the hybrid offload path. This avoids unsupported CUDA `get_rows` cases for K-quant embedding tensors (`q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`) and avoids the unstable voice-cloning prefill behavior seen when those lookups were pushed to CUDA. Transformer layers, Fast-AR, and the KV cache can still be offloaded according to `--gpu-layers`. On Vulkan and Metal, full-model offload keeps the entire model on GPU and automatically splits the weights across multiple backend buffers when the driver imposes a per-buffer allocation limit.
+On CUDA builds, `s2.cpp` keeps the large Slow-AR embedding tables on CPU in the hybrid offload path. This avoids unsupported CUDA `get_rows` cases for K-quant embedding tensors (`q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`) and avoids the unstable voice-cloning prefill behavior seen when those lookups were pushed to CUDA. Cached Fast-AR uses a dequantized GPU copy of its smaller embedding table. Transformer layers, Fast-AR, and the KV cache can still be offloaded according to `--gpu-layers`. On Vulkan and Metal, full-model offload keeps the entire model on GPU and automatically splits the weights across multiple backend buffers when the driver imposes a per-buffer allocation limit.
 
 ---
 
@@ -103,9 +103,28 @@ cmake --build build --parallel $(nproc)
 ### With CUDA GPU support (NVIDIA)
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DS2_CUDA=ON
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DS2_CUDA=ON -DGGML_CUDA_GRAPHS=ON
 cmake --build build --parallel $(nproc)
 ```
+
+CUDA graph replay is enabled by default in new CUDA build directories. Pass
+`-DGGML_CUDA_GRAPHS=ON` explicitly when upgrading an existing build whose cache
+has it disabled. For a build dedicated to one GPU, you can also set
+`-DCMAKE_CUDA_ARCHITECTURES=native` (requires a visible GPU at configure time).
+
+An optional model-backed correctness check compares semantic/EOS logits and
+incremental Fast-AR against the full-prefix decoder, exercises cache reuse and
+nonsequential-prefix fallback, and reports Fast-AR time per audio frame:
+
+```bash
+cmake -B build -DS2_BUILD_DECODE_TEST=ON
+cmake --build build --parallel $(nproc)
+./build/s2-model-decode-test /path/to/model.gguf tokenizer.json cuda 40
+./build/s2-codec-decode-test /path/to/model.gguf voices/yumi.s2voice
+```
+
+The codec check runs on CPU and verifies that adding future code frames does
+not change already decoded PCM samples.
 
 ### With Metal GPU support (macOS / Apple GPU)
 
@@ -324,7 +343,19 @@ When `--gpu-layers` covers all 36 transformer layers, Vulkan keeps the full mode
 ```
 
 `--cuda 0` selects the first CUDA device. By default, both the transformer and the audio codec follow the selected backend. If codec GPU initialization or weight allocation fails, `s2.cpp` logs the failure and falls back to CPU for the codec. Use `--codec-cpu` if you want to keep the codec on CPU explicitly.
-For stability, embedding lookups remain on CPU in the current CUDA hybrid path, while the transformer layers, Fast-AR path, and KV cache still follow the selected `--gpu-layers` split.
+For stability, the large Slow-AR embedding tables remain on CPU in the CUDA hybrid path. Generation computes only semantic-token and EOS output logits from those tables. Fast-AR caches per-layer KV state and execution graphs across codebook predictions; its smaller embedding table is dequantized once into a GPU cache to avoid repeated CPU gathers and transfers. This adds approximately 40 MiB of GPU memory for S2 Pro. Transformer layers and KV caches still follow the selected `--gpu-layers` split. Quantized matrix-vector and matrix-matrix kernels can produce small numerical differences, so generated waveforms need not be identical to those from full-prefix Fast-AR.
+
+For CUDA throughput measurements, use `--gpu-layers -1 --codec-follow-backend`
+and compare `[Metrics] Synthesis` on the same model, text, voice, and token count.
+The default `--codec-auto` selection now measures a warmed 32-frame decode;
+`--codec-follow-backend` skips that startup benchmark and forces the selected
+GPU codec. An RTF of 1 means synthesis takes as long as the generated audio.
+Single-token Slow-AR steps use fused attention when the selected GPU backend
+supports it, reading the F16 KV cache directly without expanding grouped heads.
+Unsupported kernels retain the existing attention path. C++ callers can use
+`SlowARModel::set_flash_attention(false)` to compare with the unfused path.
+See [the RTX 5050 benchmark](benchmarks/cuda-rtx5050.md) for measured timings,
+reproduction commands, and verification limits.
 
 ### GPU inference via Metal (macOS / Apple GPU)
 
@@ -369,7 +400,12 @@ For stability, embedding lookups remain on CPU in the current CUDA hybrid path, 
 | `--codec-auto` / `--codec-follow-backend` / `--codec-cpu` | `--codec-auto` | `--codec-auto` benchmarks codec backends and keeps the fastest; `--codec-follow-backend` lets the codec follow the selected GPU backend; `--codec-cpu` keeps codec on CPU. If codec GPU init or allocation fails, the runtime falls back to CPU |
 | `--codec-context-frames <n>` | `auto` | Override codec decode history window. Lower values use less VRAM but may reduce quality |
 | `--stream-file` | — | Write the WAV through the exact streaming path instead of the final one-shot save |
-| `--stream-decode-stride N` | `0` | Decode cadence in frames. `0` = auto (`4` for server streaming, `16` for `--stream-file` and offline synthesis) |
+| `--stream-decode-stride N` | `0` | Decode cadence in frames. `0` = auto (`4` for server streaming, `16` for `--stream-file`, `64` for offline synthesis) |
+
+Offline synthesis retains the codec's left history, without future-frame
+holdback, and decodes through bounded windows. It fills the first window once
+instead of repeatedly decoding growing prefixes. Generation KV memory is
+released before codec decoding so other models can share the GPU more easily.
 | `--log-level LEVEL` | `info` | Runtime log verbosity: `error`, `warn`, `info`, or `debug` |
 | `--server` | — | Start HTTP server instead of CLI synthesis |
 | `-H`, `--host` | `127.0.0.1` | Server bind address |
@@ -388,6 +424,23 @@ Start the server:
 # or with custom host/port:
 ./build/s2 --model s2-pro-q6_k.gguf --server --host 0.0.0.0 --port 8080
 ```
+
+Open `http://127.0.0.1:3030/` for the built-in S2 Studio GUI. It can generate
+speech with the default voice, test cloning from a WAV/MP3 reference and exact
+transcript, and save a reusable `.s2voice` profile. Use the Saved voice tab to
+test a profile after saving it. Saving a profile encodes the reference clip; it
+does not fine tune model weights. This implementation does not support voice
+design from a text description or model training.
+
+When using the server over SSH, bind it to an address reachable from your
+browser and open `http://<that-address>:3030/`. This can be the machine's LAN
+address or its Tailscale/VPN address. Binding to the LAN address alone does
+not make the GUI reachable through a different VPN interface. The machine's
+firewall and VPN access policy must allow the chosen port.
+
+The GUI uses the existing `POST /generate` route plus `GET /voices` to list
+profiles and `POST /voices` to save one. Keep the server bound to localhost
+unless you intend to expose these endpoints to other machines.
 
 An OpenAPI 3.1 description of the server lives at `openapi/s2-openapi.yaml`.
 
@@ -541,7 +594,7 @@ The C++ engine (`src/`) is built on a bundled [ggml](https://github.com/ggml-org
 
 - **Scheduler-based execution for Slow-AR and Fast-AR** — the model keeps dedicated `ggml_backend_sched_t` instances for the two transformer paths instead of the older persistent `gallocr` design
 - **Cached single-token step graph plus adaptive chunked prefill** — the autoregressive loop reuses the step graph, while prompt prefills build larger graphs and may be chunked on GPU backends to keep cloning scratch usage under control
-- **CUDA-only hybrid embedding path** — CUDA keeps embedding gathers on CPU for stability, while Vulkan/Metal full offload can keep the whole model on GPU
+- **CUDA-only hybrid embedding path** — CUDA keeps Slow-AR embedding gathers on CPU for stability; cached Fast-AR uses a dequantized GPU table, while Vulkan/Metal full offload can keep the whole model on GPU
 - **Automatic multi-buffer weight placement** — when a backend exposes a per-buffer allocation limit, `s2.cpp` splits large weight sets across multiple backend buffers instead of requiring one monolithic allocation
 - **Codec follows the selected backend by default** — the default `--codec-auto` mode benchmarks available backends and keeps the fastest. Use `--codec-follow-backend` to let the codec follow the selected GPU backend, or `--codec-cpu` to keep it on CPU. If codec GPU init or weight allocation fails, it falls back to CPU explicitly
 - **posix_fadvise(DONTNEED)** after loading the weights *(Linux only)* — advises the kernel to drop the GGUF file from page cache once the tensors are already in the backend buffer, reducing duplicate RAM use

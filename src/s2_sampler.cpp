@@ -41,12 +41,16 @@ static std::vector<float> softmax_from_sorted_logits(const std::vector<std::pair
 
 int32_t sample_token(const float * logits, int32_t vocab_size, const SamplerParams & params) {
     if (vocab_size <= 0) return 0;
+    if (params.temperature <= 0.0f || params.top_k == 1) {
+        return static_cast<int32_t>(std::max_element(logits, logits + vocab_size) - logits);
+    }
 
     std::vector<std::pair<float, int32_t>> items;
     items.reserve(vocab_size);
     for (int32_t i = 0; i < vocab_size; ++i) {
-        items.push_back({logits[i], i});
+        if (logits[i] != -INFINITY) items.push_back({logits[i], i});
     }
+    if (items.empty()) return 0;
 
     std::sort(items.begin(), items.end(), [](const auto & a, const auto & b) {
         return a.first > b.first;

@@ -166,13 +166,22 @@ static CodecBenchmarkResult benchmark_codec_backend(const PipelineParams & param
     }
 
     result.backend_name = codec.backend_name();
-    const int32_t benchmark_frames = 8;
+    // A tiny cold decode mostly measures graph setup, and can choose CPU even
+    // when GPU throughput is substantially better for an actual utterance.
+    const int32_t benchmark_frames = 32;
     const int32_t benchmark_threads = params.gen.n_threads > 0
         ? params.gen.n_threads
         : static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
     std::vector<int32_t> codes(static_cast<size_t>(codec.num_codebooks()) * benchmark_frames, 0);
     std::vector<float> audio_out;
 
+    // The second execution also warms CUDA graph capture when enabled.
+    for (int i = 0; i < 2; ++i) {
+        if (!codec.decode(codes.data(), benchmark_frames, benchmark_threads, audio_out)) {
+            result.error = "warmup decode failed";
+            return result;
+        }
+    }
     const auto t0 = std::chrono::steady_clock::now();
     if (!codec.decode(codes.data(), benchmark_frames, benchmark_threads, audio_out)) {
         result.error = "decode failed";
@@ -206,7 +215,7 @@ static bool decode_codes_windowed(AudioCodec & codec, const int32_t * codes,
         return false;
     }
 
-    const int32_t decode_stride_frames = std::max(1, stride_frames > 0 ? stride_frames : 16);
+    const int32_t decode_stride_frames = std::max(1, stride_frames > 0 ? stride_frames : 64);
     const int32_t history_frames = context_frames_override >= 0
         ? context_frames_override
         : std::max(0, codec.streaming_history_frames());
@@ -226,12 +235,9 @@ static bool decode_codes_windowed(AudioCodec & codec, const int32_t * codes,
             return true;
         }
 
-        const int32_t stable_frames = finalize
-            ? frames_available
-            : std::max(0, frames_available - history_frames);
-        if (stable_frames <= committed_frames && !finalize) {
-            return true;
-        }
+        // Codec attention and convolutions are causal. History is needed on
+        // the left of a window, but no future frames are needed on its right.
+        const int32_t stable_frames = frames_available;
 
         const int32_t window_start_frame = std::max(0, committed_frames - history_frames);
         const int32_t window_frames = frames_available - window_start_frame;
@@ -269,7 +275,11 @@ static bool decode_codes_windowed(AudioCodec & codec, const int32_t * codes,
         return true;
     };
 
-    for (int32_t frames_available = std::min(total_frames, decode_stride_frames);
+    // All codes are already available offline. Fill the first window once,
+    // rather than decoding successively longer prefixes during a warmup ramp.
+    const int32_t first_window_frames = static_cast<int32_t>(std::min<int64_t>(
+        total_frames, static_cast<int64_t>(history_frames) + decode_stride_frames));
+    for (int32_t frames_available = first_window_frames;
          frames_available < total_frames;
          frames_available += decode_stride_frames) {
         if (!decode_window(frames_available, false)) {
@@ -547,6 +557,23 @@ bool Pipeline::init_from_components(Tokenizer* tokenizer, SlowARModel* model, Au
 
 int32_t Pipeline::output_sample_rate() const {
     return codec().sample_rate();
+}
+
+bool Pipeline::save_voice_from_memory(const std::string & voice_id, const std::string & transcript,
+                                      const std::string & voice_dir, const void * audio, size_t audio_size,
+                                      int32_t n_threads) {
+    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    if (!initialized_ || !audio || audio_size == 0 || transcript.empty()) return false;
+    AudioData ref_audio;
+    if (!load_audio_from_memory(audio, audio_size, ref_audio, codec().sample_rate()) ||
+        ref_audio.samples.empty()) return false;
+    std::vector<int32_t> codes;
+    int32_t frames = 0;
+    if (!codec().encode(ref_audio.samples.data(), static_cast<int32_t>(ref_audio.samples.size()),
+                        n_threads, codes, frames)) return false;
+    PipelineParams params;
+    params.voice_storage_dir = voice_dir;
+    return save_voice_profile_locked(voice_id, codes, frames, transcript, params);
 }
 
 bool Pipeline::save_voice_profile_locked(const std::string & voice_id,
@@ -857,6 +884,9 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
     const auto gen_t0 = std::chrono::steady_clock::now();
     GenerateResult res = generate(model(), tokenizer().config(), prompt, params.gen);
     const auto gen_t1 = std::chrono::steady_clock::now();
+    // Generation is complete; release its KV memory before allocating codec
+    // scratch, especially when another speech model shares the GPU.
+    model().clear_kv_cache();
 
     if (res.n_frames == 0) {
         safe_print_error_ln("Pipeline error: generation produced no frames.");
@@ -864,7 +894,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
     }
 
     const int32_t offline_decode_stride_frames =
-        params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 16;
+        params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 64;
     double decode_ms = 0.0;
     int32_t decode_batches = 0;
     const auto decode_t0 = std::chrono::steady_clock::now();
@@ -877,7 +907,6 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
     }
     const auto decode_t1 = std::chrono::steady_clock::now();
 
-    model().clear_kv_cache();
     const auto synth_t1 = std::chrono::steady_clock::now();
 
     const double kv_ms = std::chrono::duration<double, std::milli>(kv_t1 - kv_t0).count();

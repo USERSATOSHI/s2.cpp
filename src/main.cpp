@@ -91,7 +91,7 @@ void print_uso() {
     safe_print("  --codec-follow-backend      Force codec to follow the selected GPU backend\n");
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
-    safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
+    safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file 16, offline 64)\n");
     safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
     safe_print("  --log-level <level>         error, warn, info, or debug (default: info)\n");
     safe_print("  --server                    Start HTTP server\n");
@@ -140,6 +140,7 @@ int main(int argc, char** argv) {
 
     fs::u8arguments u8guard(argc, argv);
 
+    s2::init_backend_logging();
     s2::PipelineParams params;
     params.model_path = "model.gguf";
     params.tokenizer_path = "tokenizer.json";

@@ -69,6 +69,9 @@ public:
                              std::vector<int32_t> & codes_out, int32_t & n_frames_out);
     bool encode_prompt_audio_data(const AudioData & ref_audio, int32_t n_threads,
                                   std::vector<int32_t> & codes_out, int32_t & n_frames_out);
+    bool save_voice_from_memory(const std::string & voice_id, const std::string & transcript,
+                                const std::string & voice_dir, const void * audio, size_t audio_size,
+                                int32_t n_threads);
     int32_t output_sample_rate() const;
 
     bool synthesize_streaming_raw(const PipelineParams & params, AudioData & ref_audio,

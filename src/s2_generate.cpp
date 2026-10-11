@@ -48,7 +48,7 @@ GenerateResult generate(
         std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl;
     }
     const auto prefill_t0 = std::chrono::steady_clock::now();
-    if (!model.prefill_fast(prompt_tm, prompt.cols, params.n_threads, state)) {
+    if (!model.prefill_fast(prompt_tm, prompt.cols, params.n_threads, state, im_end_id)) {
         std::cerr << "[Generate] Prefill failed." << std::endl;
         return out;
     }
@@ -93,6 +93,8 @@ GenerateResult generate(
     }
 
     int32_t step = 0;
+    double fast_ar_ms = 0.0;
+    double slow_steps_ms = 0.0;
     const auto loop_t0 = std::chrono::steady_clock::now();
     while (main_token != im_end_id && step < params.max_new_tokens) {
 
@@ -128,9 +130,10 @@ GenerateResult generate(
         codebooks_cb.reserve(num_cb);
         codebooks_cb.push_back(sem_code);
 
+        const auto fast_t0 = std::chrono::steady_clock::now();
         for (int32_t cb_idx = 1; cb_idx < num_cb; ++cb_idx) {
 
-            if (!model.fast_decode(state.hidden, codebooks_cb, params.n_threads, fast_logits)) {
+            if (!model.fast_decode_cached(state.hidden, codebooks_cb, params.n_threads, fast_logits)) {
                 std::cerr << "[Generate] fast_decode failed at cb " << cb_idx << std::endl;
 
                 for (int32_t r = cb_idx; r < num_cb; ++r) {
@@ -141,6 +144,8 @@ GenerateResult generate(
             int32_t cb_token = sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams);
             codebooks_cb.push_back(cb_token);
         }
+        fast_ar_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - fast_t0).count();
 
         for (int32_t cb = 0; cb < num_cb; ++cb) {
             out.codes[static_cast<size_t>(cb) * params.max_new_tokens + step] = codebooks_cb[cb];
@@ -168,10 +173,13 @@ GenerateResult generate(
             step_input[cb + 1] = codebooks_cb[cb];
         }
 
-        if (!model.step(step_input, params.n_threads, state)) {
+        const auto slow_t0 = std::chrono::steady_clock::now();
+        if (!model.step(step_input, params.n_threads, state, im_end_id)) {
             std::cerr << "[Generate] step() failed at step " << step << std::endl;
             break;
         }
+        slow_steps_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - slow_t0).count();
 
         step++;
         if (params.verbose && log_enabled(LogLevel::Info) && step % 50 == 0) {
@@ -195,7 +203,9 @@ GenerateResult generate(
                   << " ms, loop=" << loop_ms
                   << " ms, total=" << total_ms
                   << " ms, avg=" << ms_per_frame
-                  << " ms/frame" << std::endl;
+                  << " ms/frame, slow_steps=" << slow_steps_ms
+                  << " ms, fast_ar=" << fast_ar_ms
+                  << " ms" << std::endl;
     }
 
     const int32_t n_frames = out.n_frames;

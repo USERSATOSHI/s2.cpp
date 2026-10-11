@@ -13,6 +13,7 @@ option(S2_VULKAN  "Build with Vulkan backend"  OFF)
 option(S2_CUDA    "Build with CUDA backend"    OFF)
 option(S2_METAL   "Build with Metal backend"   OFF)
 option(S2_BUILD_SHARED_LIBRARIES "Build S2 shared and static library targets" OFF)
+option(S2_BUILD_DECODE_TEST "Build the model-backed AR equivalence test and benchmark" OFF)
 option(S2_AUTO_APPLY_LOCAL_PATCHES "Automatically apply local patches from patches/*.patch during build" ON)
 
 if(S2_METAL AND NOT APPLE)
@@ -58,6 +59,9 @@ else()
 endif()
 if(S2_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    # Fast-AR keeps its graphs and allocations stable across audio frames.
+    # Respect an explicit OFF, but enable replay for new CUDA build directories.
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "ggml: use CUDA graphs")
 else()
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 endif()
@@ -124,6 +128,15 @@ add_executable(s2 ${S2_CORE_SOURCES} src/main.cpp)
 s2_configure_target(s2)
 if(TARGET s2_apply_local_patches)
     add_dependencies(s2 s2_apply_local_patches)
+endif()
+
+if(S2_BUILD_DECODE_TEST)
+    add_executable(s2-model-decode-test tests/model_decode.cpp
+        src/s2_model.cpp src/s2_tokenizer.cpp src/s2_prompt.cpp src/s2_log.cpp)
+    s2_configure_target(s2-model-decode-test)
+    add_executable(s2-codec-decode-test tests/codec_decode.cpp
+        src/s2_codec.cpp src/s2_voice.cpp src/s2_log.cpp)
+    s2_configure_target(s2-codec-decode-test)
 endif()
 
 if(S2_BUILD_SHARED_LIBRARIES)

@@ -17,6 +17,7 @@
 #endif
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -112,28 +113,44 @@ public:
 private:
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
         int32_t n_tokens, int32_t n_threads,
-        StepResult & result);
+        StepResult & result, int32_t im_end_id = -1);
 public:
+    // A valid im_end_id restricts the output head to semantic tokens and EOS;
+    // other entries in StepResult::logits are -infinity. -1 returns all logits.
     bool prefill_fast(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
-        int32_t n_threads, StepResult & result);
+        int32_t n_threads, StepResult & result, int32_t im_end_id = -1);
 
     bool prefill(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                  int32_t n_threads, StepResult & result);
 
     bool step(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
-              StepResult & result);
+              StepResult & result, int32_t im_end_id = -1);
 
     bool fast_decode(const std::vector<float> & hidden,
                      const std::vector<int32_t> & prefix_codes,
                      int32_t n_threads,
                      std::vector<float> & logits_out);
 
+    // Sequential codebooks reuse per-layer KV state and fixed execution graphs.
+    // Arbitrary prefixes retain the full-prefix decoder's behavior.
+    bool fast_decode_cached(const std::vector<float> & hidden,
+                            const std::vector<int32_t> & prefix_codes,
+                            int32_t n_threads, std::vector<float> & logits_out);
+
     const ModelHParams & hparams() const { return hparams_; }
+    void set_flash_attention(bool enabled) { flash_attention_ = enabled; }
 
     ModelWeights   weights_;
 
 private:
+    struct FastDecodeCache;
+    std::unique_ptr<FastDecodeCache> fast_decode_cache_;
+    bool fast_decode_impl(const std::vector<float> & hidden,
+                          const std::vector<int32_t> & prefix_codes,
+                          int32_t n_threads, std::vector<float> & logits_out,
+                          bool use_cache);
     ModelHParams   hparams_;
+    bool flash_attention_ = true;
     ggml_backend_t backend_cpu_  = nullptr;
     ggml_backend_t backend_gpu_  = nullptr;
     ggml_backend_sched_t sched_       = nullptr;

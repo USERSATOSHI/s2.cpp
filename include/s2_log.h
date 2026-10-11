@@ -17,6 +17,7 @@ enum class LogLevel : int32_t {
 void set_log_level(LogLevel level);
 LogLevel get_log_level();
 bool log_enabled(LogLevel level);
+void init_backend_logging();
 
 }
 

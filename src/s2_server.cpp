@@ -4,6 +4,7 @@
 
 #include "../include/s2_log.h"
 #include "../include/s2_server.h"
+#include "s2_gui_html.h"
 #include <iostream>
 #include <thread>
 #include <condition_variable>
@@ -65,6 +66,14 @@ static std::string trim_copy(const std::string & value) {
     }
 
     return value.substr(begin, end - begin);
+}
+
+static bool valid_voice_id(const std::string & value) {
+    if (value.empty() || value.size() > 64) return false;
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_' || c == '-';
+    });
 }
 
 static std::vector<std::string> split_sentences_basic(const std::string & text) {
@@ -481,6 +490,49 @@ namespace s2
                 S2_LOG_INFO_STREAM("[END] " << req.method << " " << req.path
                     << " -> " << res.status
                     << " (" << duration << "ms)" << std::endl); });
+
+        svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(s2_gui_html, "text/html; charset=utf-8");
+            res.set_header("Cache-Control", "no-store");
+        });
+
+        svr.Get("/voices", [&params](const httplib::Request&, httplib::Response& res) {
+            VoiceProfileManager voices;
+            voices.set_storage_dir(params.pipeline.voice_storage_dir);
+            auto ids = voices.list();
+            std::sort(ids.begin(), ids.end());
+            res.set_content(json({{"voices", ids}}).dump(), "application/json");
+        });
+
+        svr.Post("/voices", [pipeline, server_busy, &params](const httplib::Request& req,
+                                                               httplib::Response& res) {
+            const std::string id = req.form.has_field("name") ? trim_copy(req.form.get_field("name")) : "";
+            const std::string transcript = req.form.has_field("transcript") ?
+                trim_copy(req.form.get_field("transcript")) : "";
+            httplib::FormData audio;
+            if (!valid_voice_id(id) || transcript.empty() ||
+                !get_first_form_file(req.form, {"reference"}, audio) || audio.content.empty()) {
+                res.status = 400;
+                res.set_content(json({{"error", "Provide a name (letters, digits, _ or -), transcript, and reference audio."}}).dump(), "application/json");
+                return;
+            }
+            bool expected_idle = false;
+            if (!server_busy->compare_exchange_strong(expected_idle, true)) {
+                res.status = 503;
+                res.set_content(json({{"error", "Server busy processing another request."}}).dump(), "application/json");
+                return;
+            }
+            const bool ok = pipeline->save_voice_from_memory(id, transcript,
+                params.pipeline.voice_storage_dir, audio.content.data(), audio.content.size(),
+                params.pipeline.gen.n_threads);
+            server_busy->store(false);
+            if (!ok) {
+                res.status = 500;
+                res.set_content(json({{"error", "Could not encode or save the voice profile."}}).dump(), "application/json");
+                return;
+            }
+            res.set_content(json({{"voice", id}}).dump(), "application/json");
+        });
 
         svr.Post("/generate", [pipeline, server_busy, &active_threads_mtx, &active_threads, &params](const httplib::Request& req, httplib::Response& res)
             {
